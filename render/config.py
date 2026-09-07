@@ -21,6 +21,7 @@ MODELS = {
         "min_age_hours": 3.5,          # how long after cycle time f000..f384 are complete
         # 3-hourly to 240 h, 12-hourly to 384 h
         "hours": list(range(0, 241, 6)) + list(range(252, 361, 12)),
+        "probe_max_hours": [360, 240],  # publish a 240-h run as soon as it's there; re-render to 360 when the rest lands
         "params": None,                 # None = every product in PARAMS
         "credit": "NOAA/NCEP GFS via NOMADS",
     },
@@ -30,7 +31,7 @@ MODELS = {
         "resolution": "0.25°",
         "source": "ecmwf_opendata",
         "cycles": [0, 6, 12, 18],      # 06/18 are published with a shorter range; probed at run time
-        "min_age_hours": 7,
+        "min_age_hours": 6.5,
         # open data: 3-hourly to 144 h, 6-hourly to 240 h (00/12); 06/18 stop earlier
         "hours": list(range(0, 241, 6)),
         "probe_max_hours": [240, 144, 90],
@@ -66,7 +67,7 @@ MODELS["gefs"] = {
 
 MODELS["ecens"] = {
     "id": "ecens", "name": "ECMWF ENS", "resolution": "0.25°", "source": "ecmwf_ens", "kind": "ensemble",
-    "cycles": [0, 6, 12, 18], "min_age_hours": 8.5,
+    "cycles": [0, 6, 12, 18], "min_age_hours": 7.5,
     "hours": list(range(0, 241, 6)),
     "probe_max_hours": [240, 144],           # 06/18Z ENS runs are published to 144 h
     "members": ["c00"] + [f"p{i:02d}" for i in range(1, 51)],
@@ -76,10 +77,14 @@ MODELS["ecens"] = {
 }
 
 MODELS["aifsens"] = dict(MODELS["ecens"], id="aifsens", name="ECMWF AIFS ENS", source="ecmwf_aifs_ens",
-                         min_age_hours=8.0, cycles=[0, 6, 12, 18], probe_max_hours=[240],
+                         min_age_hours=7.0, cycles=[0, 6, 12, 18], probe_max_hours=[240, 144],
                          hours=list(range(0, 241, 6)), credit="ECMWF open data AIFS-ENS (CC-BY-4.0)")
 MODELS["aigefs"] = dict(MODELS["gefs"], id="aigefs", name="AI-GEFS", source="aigefs", credit="NOAA/NCEP AIGEFS via NOMADS",
-                        min_age_hours=4.0, hours=list(range(0, 241, 6)))
+                        min_age_hours=4.0, hours=list(range(0, 241, 6)), probe_max_hours=[240, 120],
+                        # NOMADS layout (no grib_filter): fields are byte-ranged out of each member's file via its .idx
+                        path="https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/v1.0/aigefs.{ymd}/{hh}/mem{mem:03d}/model/atmos/grib2/aigefs.t{hh}z.pres.f{fhr:03d}.grib2",
+                        idx_fields=[("PRMSL", "mean sea level"), ("HGT", "500 mb"), ("TMP", "850 mb"), ("TMP", "2 m above ground"),
+                                    ("UGRD", "10 m above ground"), ("VGRD", "10 m above ground"), ("APCP", "surface")])
 
 MODELS["geps"] = {
     "id": "geps", "name": "GEPS", "resolution": "0.5°", "source": "geps", "kind": "ensemble",
@@ -89,6 +94,50 @@ MODELS["geps"] = {
     "domain": (-150, -10, 0, 66),
     "params": None, "credit": "Environment and Climate Change Canada GEPS (MSC Datamart)",
     "ens_fields": [("msl", None), ("gh", 500), ("t", 850), ("2t", None), ("10u", None), ("10v", None), ("tp", None)],
+}
+
+# ---------------------------------------------------------------- mesoscale --
+# NOAA CONUS models on NOMADS grib_filter. Their grids are Lambert conformal, so
+# fetch.load_grib regrids them to lat/lon on the way in. No subregion (grib_filter
+# only subsets lat/lon grids), so whole-CONUS files are downloaded per hour.
+_MESO_PARAMS = ["mslp_precip", "mslp_ptype", "refc", "precip24", "precip_total", "t2m", "wind10m", "cape", "pwat",
+                "t850_wind", "rh700", "z500_vort", "z500_mslp", "shear", "steering"]
+MODELS["hrrr"] = {
+    "id": "hrrr", "name": "HRRR", "resolution": "3 km", "source": "nomads_grid", "kind": "mesoscale",
+    "filter": "filter_hrrr_2d.pl", "dir": "/hrrr.{ymd}/conus", "file": "hrrr.t{hh}z.wrfsfcf{fhr:02d}.grib2",
+    "idx": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.{ymd}/conus/hrrr.t{hh}z.wrfsfcf{fhr:02d}.grib2.idx",
+    "cycles": list(range(24)), "min_age_hours": 1.75,          # every hourly run; 00/06/12/18 reach 48 h, others 18 h
+    "hours": list(range(0, 49, 1)), "probe_max_hours": [48, 18],
+    # HRRR's surface file has no 700 mb RH or 200 mb wind (per its .idx), so no rh700 / shear
+    "regions": ["conus", "seast", "gulf", "fl"], "params": [p for p in _MESO_PARAMS if p not in ("rh700", "shear")], "grid_res": 0.03,
+    "credit": "NOAA/NCEP HRRR via NOMADS",
+}
+MODELS["nam"] = {
+    "id": "nam", "name": "NAM 12 km", "resolution": "12 km", "source": "nomads_grid", "kind": "mesoscale",
+    "filter": "filter_nam.pl", "dir": "/nam.{ymd}", "file": "nam.t{hh}z.awphys{fhr:02d}.tm00.grib2",
+    "idx": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/nam/prod/nam.{ymd}/nam.t{hh}z.awphys{fhr:02d}.tm00.grib2.idx",
+    "cycles": [0, 6, 12, 18], "min_age_hours": 2.5,
+    "hours": list(range(0, 37, 1)) + list(range(39, 85, 3)), "probe_max_hours": [84],
+    "regions": ["conus", "seast", "gulf", "fl"], "params": _MESO_PARAMS, "grid_res": 0.1,
+    "credit": "NOAA/NCEP NAM via NOMADS",
+}
+MODELS["namnest"] = {
+    "id": "namnest", "name": "NAM 3 km nest", "resolution": "3 km", "source": "nomads_grid", "kind": "mesoscale",
+    "filter": "filter_nam_conusnest.pl", "dir": "/nam.{ymd}", "file": "nam.t{hh}z.conusnest.hiresf{fhr:02d}.tm00.grib2",
+    "idx": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/nam/prod/nam.{ymd}/nam.t{hh}z.conusnest.hiresf{fhr:02d}.tm00.grib2.idx",
+    "cycles": [0, 6, 12, 18], "min_age_hours": 2.5,
+    "hours": list(range(0, 61, 1)), "probe_max_hours": [60],
+    "regions": ["conus", "seast", "gulf", "fl"], "params": _MESO_PARAMS, "grid_res": 0.03,
+    "credit": "NOAA/NCEP NAM CONUS nest via NOMADS",
+}
+MODELS["nbm"] = {
+    "id": "nbm", "name": "National Blend (NBM)", "resolution": "2.5 km", "source": "nomads_grid", "kind": "mesoscale",
+    "filter": "filter_blend.pl", "dir": "/blend.{ymd}/{hh}/core", "file": "blend.t{hh}z.core.f{fhr:03d}.co.grib2",
+    "idx": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod/blend.{ymd}/{hh}/core/blend.t{hh}z.core.f{fhr:03d}.co.grib2.idx",
+    "cycles": [1, 7, 13, 19], "min_age_hours": 1.5,
+    "hours": list(range(1, 37, 1)) + list(range(39, 193, 3)), "probe_max_hours": [192, 36],
+    "regions": ["conus", "seast", "gulf", "fl"], "params": ["t2m", "wind10m", "precip6", "gust"], "grid_res": 0.03,
+    "credit": "NOAA/NWS National Blend of Models via NOMADS",
 }
 
 MODEL = MODELS[os.environ.get("WX_MODEL", "gfs").lower()]
@@ -107,7 +156,7 @@ SOURCE_FIELDS = {
 
 
 def supported(pid: str) -> bool:
-    if MODEL["source"] == "nomads":
+    if MODEL["source"] in ("nomads", "nomads_grid"):
         return PARAMS[pid].get("fetch") is not None
     spec = PARAMS[pid].get("spec")
     if spec is None:
@@ -156,6 +205,7 @@ REGIONS = {
     "namer": {"name": "North America",  "bbox": (-140, -50, 12, 62)},
     "gulf":  {"name": "Gulf of Mexico",  "bbox": (-100, -74, 16, 33)},
     "fl":    {"name": "Florida",         "bbox": (-88.5, -77.5, 23.5, 31.5)},
+    "seast": {"name": "Southeast US",    "bbox": (-95, -74, 23.5, 37.5)},
     "carib": {"name": "Caribbean",       "bbox": (-92, -55, 7, 28)},
 }
 
@@ -169,7 +219,7 @@ REGIONS = {
 # Field names the plot functions see are normalised in fetch.py so one plot
 # function serves every model.
 
-_MSLP = [("PRMSL", "mean_sea_level")]
+_MSLP = [("PRMSL", "mean_sea_level"), ("MSLMA", "mean_sea_level")]   # HRRR/NAM publish MSLMA; absent pairs are dropped
 _E_MSLP = [("msl", None)]
 _PTYPE = [("CSNOW", "surface"), ("CICEP", "surface"), ("CFRZR", "surface"), ("CRAIN", "surface")]
 
@@ -179,7 +229,7 @@ PARAMS = {
         "name": "MSLP & 6-hr precip", "group": "Precipitation", "plot": "plot_mslp_precip",
         "fetch": _MSLP + [("APCP", "surface"), ("HGT", "1000_mb"), ("HGT", "500_mb")],
         "spec": _E_MSLP + [("tp", None), ("gh", 1000), ("gh", 500)],
-        "prev": {"offsets": [6], "fetch": [], "spec": [("tp", None)]},
+        "prev": {"offsets": [6], "fetch": [("APCP", "surface")], "spec": [("tp", None)]},
     },
     "mslp_ptype": {
         "name": "MSLP & 6-hr precip (rain / frozen)", "group": "Precipitation", "plot": "plot_mslp_ptype",
@@ -188,6 +238,16 @@ PARAMS = {
     "refc": {
         "name": "Simulated radar (rain / frozen)", "group": "Precipitation", "plot": "plot_refc",
         "fetch": _MSLP + [("REFC", "entire_atmosphere")] + _PTYPE, "spec": None
+    },
+    "precip6": {
+        "name": "6-hr precipitation", "group": "Precipitation", "plot": "plot_precip6",
+        "fetch": [("APCP", "surface")], "spec": None,
+        "prev": {"offsets": [6], "fetch": [("APCP", "surface")], "spec": []},
+    },
+    "gust": {
+        "name": "10 m wind gust", "group": "Surface", "plot": "plot_gust",
+        "fetch": [("GUST", "10_m_above_ground"), ("GUST", "surface"), ("UGRD", "10_m_above_ground"), ("VGRD", "10_m_above_ground"),
+                  ("WIND", "10_m_above_ground"), ("WDIR", "10_m_above_ground")], "spec": None,
     },
     "precip24": {
         "name": "24-hr accumulated precip", "group": "Precipitation", "plot": "plot_precip24",
@@ -314,7 +374,8 @@ PARAMS = {
     # ------------------------------------------------------ surface ---------
     "wind10m": {
         "name": "MSLP & 10 m wind", "group": "Surface", "plot": "plot_wind10m",
-        "fetch": _MSLP + [("UGRD", "10_m_above_ground"), ("VGRD", "10_m_above_ground")],
+        "fetch": _MSLP + [("UGRD", "10_m_above_ground"), ("VGRD", "10_m_above_ground"),
+                          ("WIND", "10_m_above_ground"), ("WDIR", "10_m_above_ground")],   # NBM: speed + direction
         "spec": _E_MSLP + [("10u", None), ("10v", None)],
     },
     # ------------------------------------------------------ diagnostics -----
