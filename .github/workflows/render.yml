@@ -1,20 +1,17 @@
-name: Render GEFS maps and deploy
+name: Render NOAA ensembles (GEFS, AI-GEFS) and deploy
 
 on:
   schedule:
-    # Poll every 30 min; GEFS finishes ~5.5 h after cycle time.
+    # Poll every 30 min; the check job exits fast when nothing new is out.
     - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "Re-render even if this run is already live"
+        description: "Re-render even if the runs are already live"
         type: boolean
         default: false
-      run:
-        description: "Specific run YYYYMMDDHH (blank = latest available)"
-        required: false
       hours:
-        description: "Forecast hours, e.g. 0-120/6 (blank = model's full range)"
+        description: "Forecast hours, e.g. 0-120/6 (blank = each model's full range)"
         required: false
 
 permissions:
@@ -22,13 +19,12 @@ permissions:
   pages: write
   id-token: write
 
-# One render at a time; a poll that fires mid-render waits, then sees the run is live and exits.
 concurrency:
   group: render
   cancel-in-progress: false
 
 env:
-  WX_MODEL: gefs
+  WX_MODELS: gefs aigefs
   SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
 
 jobs:
@@ -36,9 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      run: ${{ steps.check.outputs.run }}
       needs_render: ${{ steps.check.outputs.needs_render }}
-      chunks: ${{ steps.check.outputs.chunks }}
+      jobs: ${{ steps.check.outputs.jobs }}
+      runs: ${{ steps.check.outputs.runs }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,15 +43,13 @@ jobs:
       - run: pip install -q requests numpy ecmwf-opendata
       - id: check
         env:
-          RUN: ${{ github.event.inputs.run }}
           HOURS: ${{ github.event.inputs.hours }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
-          ARGS="--chunks 20"
-          if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
+          ARGS="--chunks 10"
           if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
-          python render/check.py $ARGS
+          python render/check_multi.py $ARGS
 
   render:
     needs: check
@@ -64,8 +58,12 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
-        chunk: ${{ fromJson(needs.check.outputs.chunks) }}
+        include: ${{ fromJson(needs.check.outputs.jobs) }}
+    env:
+      WX_MODEL: ${{ matrix.model }}
+      WX_MANIFEST: ${{ matrix.manifest }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -82,18 +80,19 @@ jobs:
         with:
           path: ~/.local/share/cartopy
           key: natural-earth-50m-v1
-      - name: Render hours ${{ matrix.chunk }}
-        run: python render/render.py --run ${{ needs.check.outputs.run }} --hours "${{ matrix.chunk }}" --workers 4
+      - name: Render ${{ matrix.model }} hours ${{ matrix.chunk }}
+        run: python render/render.py --run ${{ matrix.run }} --hours "${{ matrix.chunk }}" --workers 4
       - uses: actions/upload-artifact@v4
         with:
-          name: images-${{ strategy.job-index }}
+          name: images-${{ matrix.model }}-${{ strategy.job-index }}
           path: site/images
           retention-days: 1
           if-no-files-found: error
 
   assemble:
     needs: [check, render]
-    if: needs.check.outputs.needs_render == 'true'
+    # run even if some slices failed: the manifest only lists hours that have images
+    if: always() && needs.check.outputs.needs_render == 'true' && needs.render.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -107,24 +106,25 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libeccodes-dev libgeos-dev libproj-dev
       - run: pip install -r requirements.txt
-      - name: Cache Natural Earth shapefiles
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/cartopy
-          key: natural-earth-50m-v1
       - name: Collect rendered slices
         uses: actions/download-artifact@v4
         with:
           pattern: images-*
           path: site/images
           merge-multiple: true
-      - name: Write manifest
+        continue-on-error: true
+      - name: Write manifests
         env:
+          RUNS: ${{ needs.check.outputs.runs }}
           HOURS: ${{ github.event.inputs.hours }}
         run: |
-          ARGS="--manifest-only --run ${{ needs.check.outputs.run }}"
-          if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
-          python render/render.py $ARGS
+          for m in $WX_MODELS; do
+            run=$(echo "$RUNS" | jq -r --arg m "$m" '.[$m] // empty')
+            if [ -z "$run" ]; then echo "no run for $m"; continue; fi
+            ARGS="--manifest-only --run $run"
+            if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
+            WX_MODEL=$m WX_MANIFEST=manifest-$m.json python render/render.py $ARGS
+          done
           find site/images -name '*.png' | wc -l
       - uses: actions/upload-pages-artifact@v3
         with:
